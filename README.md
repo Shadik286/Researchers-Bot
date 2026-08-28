@@ -68,6 +68,31 @@ This service is built for legitimate academic discovery. It is deliberately cons
 - **`403 Forbidden` ends the attempt.** It is reported as `status: "unavailable"` and never retried, re-routed, or worked around.
 - **Paywalled papers resolve to the publisher's official landing page**, labelled `accessType: "landing-page"` with `available: false`. That is the correct legal destination; the service will not point anywhere else.
 
+### Getting a PDF
+
+An open-access PDF is looked up from **every** configured full-text source,
+regardless of which source supplied the metadata - whether a free copy exists
+has nothing to do with where the record was found. The chain
+(`FULLTEXT_SOURCE_PRIORITY`) is:
+
+| Source | Key needed | Covers |
+|---|---|---|
+| **Europe PMC** | none | PMC, PLOS, MDPI, BMC, biomedical + preprints |
+| **Unpaywall** | none, but needs a **real** `CONTACT_EMAIL` | the canonical open-access index, all disciplines |
+| OpenAlex | none | OA locations (free tier has a daily quota) |
+| PubMed / CORE / Semantic Scholar | varies | repository copies |
+
+The papers in the result list get the same treatment, under a bounded budget
+(`FULLTEXT_ENRICH_MS`), so a slow index degrades the links rather than the
+response.
+
+> **Set `CONTACT_EMAIL` to a real address.** Unpaywall rejects placeholders, so
+> leaving the default disables the single best source of PDF links.
+
+If no free copy exists, the answer is the official landing page and
+`available: false`. There is no configuration that makes the service retrieve a
+paywalled PDF.
+
 Full-text link priority:
 
 | Priority | `accessType`   | Meaning |

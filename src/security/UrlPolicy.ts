@@ -55,6 +55,8 @@ export const ALLOWED_API_HOSTS: ReadonlySet<string> = new Set([
   "europepmc.org",
   // DataCite (extended fallback)
   "api.datacite.org",
+  // Unpaywall (open-access location resolver)
+  "api.unpaywall.org",
   // DOI resolver (used only to build canonical landing pages, never fetched
   // for content)
   "doi.org",

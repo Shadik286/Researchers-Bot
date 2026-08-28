@@ -15,6 +15,7 @@ import { recencyBonus, withinYearRange } from "../src/search/RankingEngine.js";
 import { stripMarkup } from "../src/utils/normalizeTitle.js";
 import { validateSearchRequest } from "../src/security/InputValidator.js";
 import { MockSource, makePaper } from "./helpers/mockSource.js";
+import type { FullTextResult } from "../src/models/FullText.js";
 
 /**
  * Regression tests for bugs found by exercising the running server against the
@@ -422,5 +423,128 @@ describe("recency filtering", () => {
     expect(recencyBonus(now, 0)).toBe(0);
     // The nudge can never outweigh a real relevance gap.
     expect(recencyBonus(now, 0.05)).toBeLessThan(0.1);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* BUG 7: open-access papers came back with NO pdfUrl                  */
+/* ------------------------------------------------------------------ */
+describe("regression: full-text resolution must not depend on which source found the paper", () => {
+  /** A source that finds the paper but knows nothing about full text. */
+  function metadataOnlySource(key: string, paper: PaperResult): MockSource {
+    return new MockSource({
+      name: `Meta-${key}`,
+      key,
+      results: [paper],
+      byDoi: { [paper.doi!]: paper },
+      fullText: null,
+    });
+  }
+
+  /** An OA index that has the PDF but never appears in search results. */
+  function oaIndexSource(key: string, pdfUrl: string): MockSource {
+    const source = new MockSource({ name: `OA-${key}`, key, results: [] });
+    const fullText: FullTextResult = {
+      available: true,
+      url: pdfUrl,
+      type: "pdf",
+      accessType: "open-access",
+      source: `OA-${key}`,
+    };
+    source.getFullText = async () => fullText;
+    return source;
+  }
+
+  it("finds the PDF from an OA index even though another source found the paper", async () => {
+    // Observed live: DOAJ found a PLOS paper and reported isOpenAccess true,
+    // but the record carried only a doi.org link, so pdfUrl was undefined.
+    // The resolver only asked sources that "knew" the paper, so the OA index
+    // holding the actual PDF was never consulted.
+    const paper = makePaper({
+      source: "Meta-doaj",
+      doi: "10.1371/journal.pone.0266462",
+      title: "Blockchain technology in healthcare",
+      isOpenAccess: true,
+      landingPageUrl: "https://doi.org/10.1371/journal.pone.0266462",
+    });
+    delete paper.pdfUrl;
+
+    const cfg = buildConfig({
+      NODE_ENV: "test",
+      SOURCE_PRIORITY: "doaj",
+      FALLBACK_SOURCE_PRIORITY: "crossref",
+      EXTENDED_SOURCE_PRIORITY: "datacite",
+      SIMILAR_SOURCE_PRIORITY: "semanticScholar",
+      FULLTEXT_SOURCE_PRIORITY: "europepmc",
+      CACHE_TTL_SECONDS: "0",
+    });
+    const registry = new SourceRegistry({
+      config: cfg,
+      cache: new MemoryCache({ defaultTtlSeconds: 0, maxEntries: 10 }),
+      logger: silentLogger,
+      fetchImpl: (async () => {
+        throw new Error("A test attempted a real network request");
+      }) as typeof fetch,
+    });
+    registry.register("doaj", metadataOnlySource("doaj", paper));
+    registry.register("europepmc", oaIndexSource("europepmc", "https://journals.plos.org/a.pdf"));
+    for (const key of ["crossref", "datacite", "semanticScholar"]) {
+      registry.register(key, new MockSource({ name: key, key, results: [] }));
+    }
+
+    const orchestrator = new SearchOrchestrator({ registry, config: cfg, logger: silentLogger });
+    const response = await orchestrator.findPaper({ doi: "10.1371/journal.pone.0266462" });
+
+    expect(response.exactPaper).not.toBeNull();
+    expect(response.fullText).toMatchObject({ type: "pdf", accessType: "open-access" });
+    expect(response.fullText?.url).toBe("https://journals.plos.org/a.pdf");
+    // The PDF must also be on the paper itself, not only in `fullText`.
+    expect(response.exactPaper?.pdfUrl).toBe("https://journals.plos.org/a.pdf");
+    expect(response.exactPaper?.isOpenAccess).toBe(true);
+  });
+
+  it("never invents a PDF for a paywalled paper", async () => {
+    const paper = makePaper({
+      source: "Meta-doaj",
+      doi: "10.1038/nature14539",
+      title: "A Closed Access Paper",
+      isOpenAccess: false,
+      landingPageUrl: "https://www.nature.com/articles/nature14539",
+    });
+    delete paper.pdfUrl;
+
+    const cfg = buildConfig({
+      NODE_ENV: "test",
+      SOURCE_PRIORITY: "doaj",
+      FALLBACK_SOURCE_PRIORITY: "crossref",
+      EXTENDED_SOURCE_PRIORITY: "datacite",
+      SIMILAR_SOURCE_PRIORITY: "semanticScholar",
+      FULLTEXT_SOURCE_PRIORITY: "europepmc",
+      CACHE_TTL_SECONDS: "0",
+    });
+    const registry = new SourceRegistry({
+      config: cfg,
+      cache: new MemoryCache({ defaultTtlSeconds: 0, maxEntries: 10 }),
+      logger: silentLogger,
+      fetchImpl: (async () => {
+        throw new Error("A test attempted a real network request");
+      }) as typeof fetch,
+    });
+    registry.register("doaj", metadataOnlySource("doaj", paper));
+    // The OA index has nothing for this DOI - the honest answer.
+    const closed = new MockSource({ name: "OA-europepmc", key: "europepmc", results: [] });
+    closed.getFullText = async () => null;
+    registry.register("europepmc", closed);
+    for (const key of ["crossref", "datacite", "semanticScholar"]) {
+      registry.register(key, new MockSource({ name: key, key, results: [] }));
+    }
+
+    const orchestrator = new SearchOrchestrator({ registry, config: cfg, logger: silentLogger });
+    const response = await orchestrator.findPaper({ doi: "10.1038/nature14539" });
+
+    expect(response.exactPaper?.pdfUrl).toBeUndefined();
+    expect(response.fullText?.type).not.toBe("pdf");
+    expect(response.fullText?.accessType).toBe("landing-page");
+    expect(response.fullText?.url).toBe("https://www.nature.com/articles/nature14539");
   });
 });

@@ -93,10 +93,16 @@ export class SearchOrchestrator {
     if (main.paper && main.verdict) {
       exactPaper = this.matchEngine.annotate(main.paper, main.verdict);
       fullText = await this.resolveFullText(exactPaper, requestSignal);
-      if (fullText?.url && !exactPaper.pdfUrl && fullText.type === "pdf") {
+
+      // Surface the resolved PDF on the paper itself, so a client reading only
+      // `exactPaper` still gets the download link.
+      if (fullText?.type === "pdf" && fullText.url && !exactPaper.pdfUrl) {
         exactPaper = { ...exactPaper, pdfUrl: fullText.url };
       }
-      if (fullText?.accessType === "open-access" && exactPaper.isOpenAccess === undefined) {
+      if (fullText?.url && !exactPaper.landingPageUrl && fullText.type === "html") {
+        exactPaper = { ...exactPaper, landingPageUrl: fullText.url };
+      }
+      if (fullText?.available === true && exactPaper.isOpenAccess === undefined) {
         exactPaper = { ...exactPaper, isOpenAccess: true };
       }
     }
@@ -126,6 +132,11 @@ export class SearchOrchestrator {
       // related papers.
       similarPapers = this.rankDiscoveryResults(query, main.candidates);
     }
+    // Fill in open-access PDFs for the result list too. For a keyword search
+    // these ARE the results, and sources like Crossref carry no PDF at all,
+    // so without this the list comes back with no download links.
+    similarPapers = await this.enrichWithFullText(similarPapers, requestSignal);
+
     const similarPapersMs = Date.now() - similarStartedAt;
 
     // ---- PHASE 11: response ----------------------------------------------
@@ -574,6 +585,69 @@ export class SearchOrchestrator {
 
   /** Best candidate that is close but did not clear the exact-match gate. */
   /**
+   * Best-effort open-access PDF lookup for a list of papers.
+   *
+   * Bounded on purpose: it only touches papers that have an identifier but no
+   * PDF yet, runs under its own short deadline, and returns whatever resolved
+   * when that deadline passes. A slow OA index degrades the links, never the
+   * response.
+   */
+  private async enrichWithFullText(papers: PaperResult[], signal?: AbortSignal): Promise<PaperResult[]> {
+    const needsLookup = papers.filter(
+      (p) => !p.pdfUrl && (p.doi || p.pmcid || p.pmid || p.arxivId),
+    );
+    if (needsLookup.length === 0) return papers;
+
+    const controller = new AbortController();
+    const onOuterAbort = (): void => controller.abort();
+    signal?.addEventListener("abort", onOuterAbort, { once: true });
+    const timer = setTimeout(() => controller.abort(), this.config.budget.fullTextEnrichMs);
+
+    // Only the cheapest, highest-yield OA indexes are used here. Running the
+    // whole chain per paper would be ~6 requests x N papers, which dominated
+    // the response time (54s on a keyword search) for very little extra yield.
+    const resolvers = this.registry
+      .fullTextSources()
+      .filter((s) => ENRICH_RESOLVERS.has(s.key) && s.isAvailable());
+    if (resolvers.length === 0) {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onOuterAbort);
+      return papers;
+    }
+
+    const resolved = new Map<PaperResult, FullTextResult>();
+    try {
+      await Promise.allSettled(
+        needsLookup.map(async (paper) => {
+          const fullText = await this.resolveFullText(paper, controller.signal, resolvers);
+          if (fullText.type === "pdf" && fullText.url) resolved.set(paper, fullText);
+        }),
+      );
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onOuterAbort);
+      if (!controller.signal.aborted) controller.abort();
+    }
+
+    if (resolved.size > 0) {
+      this.logger.info("similar_full_text_enriched", {
+        attempted: needsLookup.length,
+        resolved: resolved.size,
+      });
+    }
+
+    return papers.map((paper) => {
+      const fullText = resolved.get(paper);
+      if (!fullText?.url) return paper;
+      return {
+        ...paper,
+        pdfUrl: fullText.url,
+        isOpenAccess: paper.isOpenAccess ?? true,
+      };
+    });
+  }
+
+  /**
    * Ranks raw candidates by relevance to the QUERY (not to a main paper).
    *
    * Used for keyword/author-only discovery searches, where no single paper can
@@ -642,49 +716,60 @@ export class SearchOrchestrator {
    * to its official landing page; nothing here attempts to obtain a copy the
    * publisher has not made public.
    */
-  private async resolveFullText(paper: PaperResult, signal?: AbortSignal): Promise<FullTextResult> {
-    const best: FullTextResult[] = [deriveFullText(paper)];
+  private async resolveFullText(
+    paper: PaperResult,
+    signal?: AbortSignal,
+    sources?: readonly AcademicSource[],
+  ): Promise<FullTextResult> {
+    const candidates: FullTextResult[] = [deriveFullText(paper)];
 
-    const preferred = ["openalex", "pubmed", "core", "semanticScholar"];
-    for (const key of preferred) {
-      if (signal?.aborted) break;
-      const source = this.registry.get(key);
-      if (!source || !source.isAvailable() || typeof source.getFullText !== "function") continue;
-      // Only ask a source that plausibly knows this paper.
-      if (!this.sourceKnowsPaper(key, paper)) continue;
+    // A paper needs SOME identifier for an OA index to look it up. Without
+    // one, the links already on the record are all we have.
+    const identifiable = Boolean(paper.doi || paper.pmcid || paper.pmid || paper.arxivId);
+    const hasOpenPdf = (): boolean =>
+      candidates.some(
+        (r) => r.type === "pdf" && (r.accessType === "open-access" || r.accessType === "repository"),
+      );
 
-      try {
-        const result = await source.getFullText(paper, signal);
-        if (result) best.push(result);
-      } catch (error) {
-        this.logger.debug("full_text_lookup_failed", {
-          source: source.name,
-          error: error instanceof Error ? error.message : String(error),
-        });
+    if (identifiable && !hasOpenPdf()) {
+      // Ask EVERY configured full-text source, not just the one that happened
+      // to find the metadata: whether a free copy exists is independent of
+      // where the record came from. This is what previously caused papers
+      // flagged open-access to come back with no PDF at all.
+      for (const source of sources ?? this.registry.fullTextSources()) {
+        if (signal?.aborted || hasOpenPdf()) break;
+        if (!source.isAvailable() || typeof source.getFullText !== "function") continue;
+
+        try {
+          const result = await source.getFullText(paper, signal);
+          if (result) candidates.push(result);
+        } catch (error) {
+          this.logger.debug("full_text_lookup_failed", {
+            source: source.name,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
       }
-      // An open-access PDF is the best possible answer; stop as soon as we
-      // have one rather than making further calls.
-      if (best.some((r) => r.type === "pdf" && r.accessType === "open-access")) break;
     }
 
-    return pickBestFullText(best);
+    const resolved = pickBestFullText(candidates);
+    this.logger.info("full_text_resolved", {
+      accessType: resolved.accessType,
+      type: resolved.type,
+      available: resolved.available,
+      via: resolved.source,
+      sourcesTried: identifiable ? (sources ?? this.registry.fullTextSources()).length : 0,
+    });
+    return resolved;
   }
 
-  private sourceKnowsPaper(key: string, paper: PaperResult): boolean {
-    if (paper.sources?.some((s) => s.toLowerCase().includes(key.toLowerCase()))) return true;
-    switch (key) {
-      case "pubmed":
-        return Boolean(paper.pmid || paper.pmcid || paper.doi);
-      case "openalex":
-        return Boolean(paper.doi || paper.pmid);
-      case "core":
-      case "semanticScholar":
-        return Boolean(paper.doi || paper.arxivId);
-      default:
-        return Boolean(paper.doi);
-    }
-  }
 }
+
+/**
+ * Resolvers cheap enough to run once per result. Both answer from a single
+ * request and index open-access copies directly.
+ */
+const ENRICH_RESOLVERS = new Set(["europepmc", "unpaywall"]);
 
 /** Ranking of access types, best (most useful and fully legal) first. */
 const ACCESS_RANK: Record<FullTextResult["accessType"], number> = {

@@ -151,6 +151,8 @@ export interface AppConfig {
     minSimilarPapers: number;
     maxSimilarCandidates: number;
     searchDeadlineMs: number;
+    /** Budget for the best-effort PDF lookup over the result list. */
+    fullTextEnrichMs: number;
   };
 
   matching: {
@@ -172,6 +174,7 @@ export interface AppConfig {
   sourcePriority: string[];
   fallbackSourcePriority: string[];
   extendedSourcePriority: string[];
+  fullTextSourcePriority: string[];
   similarSourcePriority: string[];
 
   server: {
@@ -279,6 +282,7 @@ export function buildConfig(env: Env = process.env): AppConfig {
       minSimilarPapers: minSimilar,
       maxSimilarCandidates: num(env, "MAX_SIMILAR_CANDIDATES", 50, 10, 500),
       searchDeadlineMs: num(env, "SEARCH_DEADLINE_MS", 45_000, 1000, 300_000),
+      fullTextEnrichMs: num(env, "FULLTEXT_ENRICH_MS", 12_000, 0, 60_000),
     },
 
     matching: {
@@ -300,6 +304,17 @@ export function buildConfig(env: Env = process.env): AppConfig {
     ]),
     fallbackSourcePriority: list(env, "FALLBACK_SOURCE_PRIORITY", ["crossref", "openalex"]),
     extendedSourcePriority: list(env, "EXTENDED_SOURCE_PRIORITY", ["europepmc", "datacite"]),
+    // Order matters: keyless and reliable first. Europe PMC and Unpaywall both
+    // index open-access PDFs directly, so they answer most cases without
+    // depending on OpenAlex (whose free tier has a daily quota).
+    fullTextSourcePriority: list(env, "FULLTEXT_SOURCE_PRIORITY", [
+      "europepmc",
+      "unpaywall",
+      "openalex",
+      "pubmed",
+      "core",
+      "semanticScholar",
+    ]),
     // Europe PMC sits between the two big similarity APIs and the slow ones:
     // when Semantic Scholar is throttled and the OpenAlex daily quota is
     // spent, it is what keeps the similar-paper phase producing results.
@@ -354,6 +369,7 @@ export function redactedConfigSnapshot(config: AppConfig): Record<string, unknow
     sourcePriority: config.sourcePriority,
     fallbackSourcePriority: config.fallbackSourcePriority,
     extendedSourcePriority: config.extendedSourcePriority,
+    fullTextSourcePriority: config.fullTextSourcePriority,
     similarSourcePriority: config.similarSourcePriority,
     budget: config.budget,
     matching: config.matching,

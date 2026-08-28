@@ -16,6 +16,7 @@ import { EuropePmcSource } from "../sources/europepmc/EuropePmcSource.js";
 import { DoajSource } from "../sources/doaj/DoajSource.js";
 import { OpenAlexSource } from "../sources/openalex/OpenAlexSource.js";
 import { PubMedSource } from "../sources/pubmed/PubMedSource.js";
+import { UnpaywallSource } from "../sources/unpaywall/UnpaywallSource.js";
 import { SemanticScholarSource } from "../sources/semanticScholar/SemanticScholarSource.js";
 import type { AppConfig } from "./env.js";
 import { trafficPolicyFor } from "./rateLimits.js";
@@ -41,6 +42,7 @@ export const SOURCE_FACTORIES: Record<string, SourceFactory> = {
   openalex: (deps) => new OpenAlexSource(deps),
   europepmc: (deps) => new EuropePmcSource(deps),
   datacite: (deps) => new DataCiteSource(deps),
+  unpaywall: (deps) => new UnpaywallSource(deps),
 };
 
 /** Per-source auth headers. Values come from env and are never logged. */
@@ -109,6 +111,7 @@ export class SourceRegistry {
       ...config.fallbackSourcePriority,
       ...config.extendedSourcePriority,
       ...config.similarSourcePriority,
+      ...config.fullTextSourcePriority,
     ]);
 
     for (const key of allKeys) {
@@ -164,6 +167,15 @@ export class SourceRegistry {
    */
   extendedSources(): AcademicSource[] {
     return this.resolve(this.config.extendedSourcePriority).slice(0, this.config.budget.maxExtendedSources);
+  }
+
+  /**
+   * Sources consulted when resolving a legal full text (PHASE 7), in order.
+   * These are asked regardless of which source found the paper: whether an
+   * open-access copy exists is independent of where the metadata came from.
+   */
+  fullTextSources(): AcademicSource[] {
+    return this.resolve(this.config.fullTextSourcePriority);
   }
 
   /** Sources used to build the similar-paper candidate pool (PHASE 8). */

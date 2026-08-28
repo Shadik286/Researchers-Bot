@@ -62,6 +62,8 @@ const BASE_LIMITS: Record<string, RateLimitConfig> = {
   // Neither publishes a hard numeric limit; both ask for considerate use.
   europepmc: { requestsPerSecond: 2, maxConcurrency: 1, maxRetries: 2 },
   datacite: { requestsPerSecond: 2, maxConcurrency: 1, maxRetries: 2 },
+  // Unpaywall allows 100k/day; we stay far below.
+  unpaywall: { requestsPerSecond: 5, maxConcurrency: 2, maxRetries: 2 },
 };
 
 /** Bonus limits unlocked by a configured API key (per provider documentation). */
