@@ -977,10 +977,4 @@ tests/
   helpers/mockSource.ts
 
 .env.example  .gitignore  package.json  tsconfig.json  vitest.config.ts
-```
 
----
-
-## License
-
-MIT. You are responsible for complying with the terms of service of each academic API you enable.
